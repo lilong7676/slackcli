@@ -3,6 +3,9 @@
   "version": "0.19.1",
   "description": "A fast, developer-friendly CLI tool for interacting with Slack workspaces",
   "main": "src/index.ts",
+  "bin": {
+    "slackcli": "src/index.ts"
+  },
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
