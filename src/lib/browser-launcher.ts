@@ -34,7 +34,7 @@ export type BrowserLaunchResult =
       port: number;
       executable: string;
       /** Terminate the browser. Idempotent; escalates to SIGKILL. */
-      stop: () => Promise<void>;
+      stop: (options?: StopOptions) => Promise<void>;
     }
   | { ok: false; reason: BrowserLaunchFailure; message: string };
 
@@ -299,6 +299,66 @@ export function signalBrowserTree(
   if (signal === 'SIGKILL') (deps.sweep ?? sweepProfileHelpers)(profileDir);
 }
 
+export interface StopOptions {
+  /**
+   * How long a browser that was already asked to quit (CDP `Browser.close`)
+   * gets to exit on its own before any signal.
+   */
+  graceMs?: number;
+}
+
+/** Seams for `shutDownBrowser()`; `launchBrowser` wires them to the real child. */
+export interface ShutdownDeps {
+  exited: () => boolean;
+  signal: (signal: NodeJS.Signals) => void;
+  sweep: () => void;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/**
+ * Bring the browser down, gently first. Exported for tests.
+ *
+ * A browser that is already quitting is left to finish. A SIGTERM that lands
+ * mid-shutdown cuts it short, and cookies set in the last seconds never reach
+ * disk: the `d` session cookie a sign-in had just set was lost that way, so
+ * the profile kept Slack's tokens without a session and the next run had to
+ * sign in again. Measured 2026-11-17 on macOS: after `Browser.close`, a test
+ * cookie survived 1 of 4 immediate SIGTERMs and 4 of 4 natural exits, which
+ * took about 150 ms.
+ */
+export async function shutDownBrowser(deps: ShutdownDeps, options: StopOptions = {}): Promise<void> {
+  const sleepFn = deps.sleep ?? sleep;
+  const now = deps.now ?? (() => Date.now());
+
+  const graceUntil = now() + (options.graceMs ?? 0);
+  while (!deps.exited() && now() < graceUntil) await sleepFn(100);
+
+  if (deps.exited()) {
+    // The parent is gone but helpers may not be; sweep the group regardless.
+    deps.signal('SIGKILL');
+    return;
+  }
+
+  // SIGTERM first so the browser flushes its profile — the session cookies
+  // and localConfig_v2 we depend on next run live there.
+  deps.signal('SIGTERM');
+  for (let i = 0; i < 30; i++) {
+    if (deps.exited()) break;
+    await sleepFn(100);
+  }
+  deps.signal('SIGKILL');
+
+  // Chrome leaves a `--type=utility` helper behind even after closing itself
+  // cleanly, so one targeted sweep clears the residue. Order matters: this
+  // runs only AFTER the browser has shut down and released its profile
+  // locks. Sweeping *instead of* a clean shutdown leaves the profile in a
+  // state Chrome refuses to reopen (exit 13, "profile in use"), which broke
+  // login entirely when it was tried the other way round.
+  await sleepFn(300);
+  deps.sweep();
+}
+
 /**
  * The browser's argv for this launch, or the refusal to return when the start
  * URL is unsafe. Exported for tests.
@@ -496,31 +556,16 @@ export async function launchBrowser(
     exitedEarly = true;
   });
 
-  const stop = async (): Promise<void> => {
+  const stop = async (options: StopOptions = {}): Promise<void> => {
     unregisterReap();
-    if (hasExited(child)) {
-      // The parent is gone but helpers may not be; sweep the group regardless.
-      signalTree('SIGKILL');
-      return;
-    }
-
-    // SIGTERM first so the browser flushes its profile — the session cookies
-    // and localConfig_v2 we depend on next run live there.
-    signalTree('SIGTERM');
-    for (let i = 0; i < 30; i++) {
-      if (hasExited(child)) break;
-      await sleep(100);
-    }
-    signalTree('SIGKILL');
-
-    // Chrome leaves a `--type=utility` helper behind even after closing itself
-    // cleanly, so one targeted sweep clears the residue. Order matters: this
-    // runs only AFTER the browser has shut down and released its profile
-    // locks. Sweeping *instead of* a clean shutdown leaves the profile in a
-    // state Chrome refuses to reopen (exit 13, "profile in use"), which broke
-    // login entirely when it was tried the other way round.
-    await sleep(300);
-    sweepProfileHelpers(profileDir);
+    await shutDownBrowser(
+      {
+        exited: () => hasExited(child),
+        signal: signalTree,
+        sweep: () => sweepProfileHelpers(profileDir),
+      },
+      options
+    );
   };
 
   const launchedAt = Date.now();

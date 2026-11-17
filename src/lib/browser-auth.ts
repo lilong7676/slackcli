@@ -368,7 +368,12 @@ export async function captureSlackTokens(
   // localStorage each tick makes the two sources genuine alternatives rather
   // than a primary and a decoration: either one alone is enough to finish.
   const deadline = now() + timeoutMs;
-  const poll: PollState = { fromLocalConfig: [], consecutiveProbeFailures: 0, rejected };
+  const poll: PollState = {
+    fromLocalConfig: [],
+    consecutiveProbeFailures: 0,
+    rejected,
+    sawTokenWithoutCookie: false,
+  };
   let outcome: PollOutcome = 'waiting';
   while (outcome === 'waiting' && now() < deadline) {
     outcome = await pollOnce(session, intercepted, poll);
@@ -386,8 +391,10 @@ export async function captureSlackTokens(
   }
 
   // Checked against the sources rather than `outcome`: a token intercepted
-  // during the final sleep still counts.
-  if (poll.fromLocalConfig.length === 0 && intercepted.size === 0) {
+  // during the final sleep still counts, but only with the `d` cookie beside
+  // it, as in pollOnce.
+  const sawToken = poll.fromLocalConfig.length > 0 || intercepted.size > 0;
+  if (!sawToken || (outcome !== 'found' && !(await readSessionCookie(session)))) {
     return logFailure(captureTimeout(options.headless));
   }
 
@@ -484,11 +491,14 @@ interface PollState {
   fromLocalConfig: CapturedWorkspace[];
   consecutiveProbeFailures: number;
   rejected: ReadonlySet<string>;
+  /** A token has turned up with no `d` cookie beside it; logged once. */
+  sawTokenWithoutCookie: boolean;
 }
 
 /**
- * One tick of the sign-in wait: read localStorage, stop if either source has
- * a token, otherwise probe that the browser is still there.
+ * One tick of the sign-in wait: read localStorage, stop once either source has
+ * a token and the `d` cookie is there too, otherwise probe that the browser is
+ * still there.
  */
 async function pollOnce(
   session: CdpSession,
@@ -496,7 +506,20 @@ async function pollOnce(
   state: PollState
 ): Promise<PollOutcome> {
   state.fromLocalConfig = await readWorkspacesFromLocalStorage(session, state.rejected);
-  if (state.fromLocalConfig.length > 0 || intercepted.size > 0) return 'found';
+  if (state.fromLocalConfig.length > 0 || intercepted.size > 0) {
+    if (await readSessionCookie(session)) return 'found';
+    // A token without the `d` cookie is a leftover, not a session. localStorage
+    // outlives the cookie (a session Slack expired, a sign-out elsewhere, a
+    // cookie the browser never flushed to disk), and Slack is then showing its
+    // sign-in form. Finishing here closed that window before the user could
+    // sign in, and every later run did the same. Requests seen so far carried
+    // no session either, so drop them and record the ones after sign-in.
+    intercepted.clear();
+    if (!state.sawTokenWithoutCookie) {
+      state.sawTokenWithoutCookie = true;
+      logger.info('Slack token found without a session cookie; waiting for sign-in');
+    }
+  }
 
   if (await sessionAlive(session)) {
     state.consecutiveProbeFailures = 0;
@@ -680,17 +703,26 @@ export async function openBrowserSession(
       // locks — signalling the parent leaves the helpers orphaned, and killing
       // them outright leaves the profile in a state Chrome refuses to reopen.
       // Best effort: if it does not oblige, `stopBrowser` still escalates.
+      let closing = false;
+      let giveUp: ReturnType<typeof setTimeout> | undefined;
       try {
-        await Promise.race([
-          session.send('Browser.close'),
-          new Promise((resolve) => setTimeout(resolve, 5_000)),
+        closing = await Promise.race([
+          session.send('Browser.close').then(() => true),
+          new Promise<boolean>((resolve) => {
+            giveUp = setTimeout(() => resolve(false), 5_000);
+          }),
         ]);
       } catch {
         // Browser already gone, or the command is unavailable.
+      } finally {
+        // A pending timer would hold the CLI open for the rest of the 5 s.
+        clearTimeout(giveUp);
       }
 
       session.close();
-      await stopBrowser();
+      // A browser that agreed to quit is left to finish: a signal mid-shutdown
+      // loses the cookies a sign-in just set (see `shutDownBrowser`).
+      await stopBrowser(closing ? { graceMs: 5_000 } : {});
     };
 
     return { ok: true, session, stop };

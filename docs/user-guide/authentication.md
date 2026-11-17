@@ -116,8 +116,10 @@ session it holds: Slack can expire or revoke that session (a workspace session
 limit, or "sign out of all other sessions") while the profile still carries the
 old tokens. If Slack refuses every captured token, `login-auto` keeps the window
 open, says the saved session has expired, and waits for you to sign in again
-within the same `--timeout`. With `--headless` there is no window to sign in to,
-so the run fails instead; re-run without `--headless`.
+within the same `--timeout`. A profile that still holds Slack's tokens but has
+lost its `d` session cookie is treated as signed out the same way: the window
+stays on Slack's sign-in page until you sign in. With `--headless` there is no
+window to sign in to, so the run fails instead; re-run without `--headless`.
 
 ## 3. Parse a cURL command
 

@@ -416,6 +416,9 @@ describe('slackOriginFromApiUrl', () => {
 interface FakeOptions {
   requests?: Array<{ url: string; postData?: string }>;
   cookies?: Array<{ name?: string; domain?: string; value?: string }>;
+  /** Replaces `cookies`: the nth cookie read answers with the nth entry, and
+   *  the last one repeats — a cookie that disappears mid-capture. */
+  cookiesPerRead?: Array<Array<{ name?: string; domain?: string; value?: string }>>;
   localConfig?: string | null;
   throwOn?: string;
   /** Every command starts failing after this many calls — a browser the user
@@ -429,6 +432,7 @@ interface FakeOptions {
 function makeFakeSession(options: FakeOptions = {}): CdpSession {
   const handlers = new Map<string, Array<(params: any) => void>>();
   let calls = 0;
+  let cookieReads = 0;
   let transientRemaining = options.transientFailures ?? 0;
   return {
     on(method, handler) {
@@ -456,6 +460,9 @@ function makeFakeSession(options: FakeOptions = {}): CdpSession {
         }
       }
       if (method === 'Storage.getCookies' || method === 'Network.getCookies') {
+        cookieReads += 1;
+        const perRead = options.cookiesPerRead;
+        if (perRead?.length) return { cookies: perRead[Math.min(cookieReads, perRead.length) - 1] } as T;
         return { cookies: options.cookies ?? [] } as T;
       }
       if (method === 'Runtime.evaluate') {
@@ -563,10 +570,31 @@ describe('captureSlackTokens', () => {
     expect(result.reason).toBe('capture_timeout');
   });
 
-  it('reports no_cookie when a session is found but the d cookie is missing', async () => {
+  // A token with no `d` cookie is what a profile looks like after its session
+  // is gone: localStorage keeps the token, Slack shows its sign-in form. Ending
+  // the capture there closed the window before the user could sign in.
+  it('keeps waiting while a token comes without the d cookie, then times out', async () => {
     const session = makeFakeSession({
       requests: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }],
+      localConfig: LOCAL_CONFIG,
       cookies: [],
+    });
+
+    const result = await captureSlackTokens(session, {
+      ...captureDeps,
+      now: advancingClock(),
+      timeoutMs: 3000,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('capture_timeout');
+  });
+
+  it('reports no_cookie when the cookie vanishes between finding the session and reading it', async () => {
+    const session = makeFakeSession({
+      requests: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }],
+      cookiesPerRead: [SLACK_COOKIES, []],
     });
 
     const result = await captureSlackTokens(session, { ...captureDeps, now: advancingClock() });
@@ -701,6 +729,8 @@ describe('captureSlackTokens', () => {
     localConfigs?: Array<string | null>;
     emitOnRead?: Record<number, Array<{ url?: unknown; postData?: unknown }>>;
     cookies?: Array<{ name?: string; domain?: string; value?: string }>;
+    /** No cookie at all before this localStorage read: the user signs in then. */
+    cookiesFromRead?: number;
     /** 1-based liveness probes that fail, as a renavigating tab's do. */
     failingProbes?: number[];
   }) {
@@ -712,7 +742,8 @@ describe('captureSlackTokens', () => {
       },
       async send<T>(method: string, params?: Record<string, unknown>): Promise<T> {
         if (method === 'Storage.getCookies' || method === 'Network.getCookies') {
-          return { cookies: script.cookies ?? SLACK_COOKIES } as T;
+          const signedIn = stats.localConfigReads >= (script.cookiesFromRead ?? 0);
+          return { cookies: signedIn ? (script.cookies ?? SLACK_COOKIES) : [] } as T;
         }
         if (method !== 'Runtime.evaluate') return {} as T;
         if (!String(params?.expression ?? '').includes('localConfig_v2')) {
@@ -1045,17 +1076,90 @@ describe('captureSlackTokens', () => {
     });
   });
 
+  // A profile whose session is gone keeps its token in localStorage but has no
+  // `d` cookie, and Slack shows the sign-in form. The capture has to wait for
+  // that sign-in rather than end on the leftover token.
+  describe('with a token but no session cookie', () => {
+    const teamWith = (token: string) =>
+      JSON.stringify({ teams: { T111: { id: 'T111', domain: 'alpha', token } } });
+    const LEFTOVER = 'xoxc-leftover-111';
+    const FRESH = 'xoxc-fresh-222';
+
+    it('waits for the user to sign in, then captures the fresh token', async () => {
+      const { session, stats } = makeScriptedSession({
+        localConfigs: [teamWith(LEFTOVER), teamWith(LEFTOVER), teamWith(FRESH)],
+        cookiesFromRead: 3,
+      });
+
+      const result = await captureSlackTokens(session, {
+        sleep: async () => {},
+        now: advancingClock(),
+        timeoutMs: 300_000,
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        xoxd: 'xoxd-session-abc',
+        workspaces: [{ workspaceUrl: 'https://alpha.slack.com', xoxc: FRESH, teamId: 'T111' }],
+      });
+      // Reads 1–2 have no cookie, so each is followed by a liveness probe.
+      expect(stats.probes).toBe(2);
+    });
+
+    it('drops requests seen before the cookie and keeps the one sent after sign-in', async () => {
+      const { session } = makeScriptedSession({
+        emitOnRead: {
+          1: [{ url: 'https://alpha.slack.com/api/client.boot', postData: `token=${LEFTOVER}` }],
+          3: [{ url: 'https://alpha.slack.com/api/client.boot', postData: `token=${FRESH}` }],
+        },
+        cookiesFromRead: 3,
+      });
+
+      const result = await captureSlackTokens(session, {
+        sleep: async () => {},
+        now: advancingClock(),
+        timeoutMs: 300_000,
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.workspaces).toEqual([{ workspaceUrl: 'https://alpha.slack.com', xoxc: FRESH }]);
+    });
+
+    it('times out, not no_cookie, when the user never signs in', async () => {
+      const { session } = makeScriptedSession({
+        localConfigs: [teamWith(LEFTOVER)],
+        emitOnRead: { 1: [{ url: 'https://alpha.slack.com/api/x', postData: `token=${LEFTOVER}` }] },
+        cookies: [],
+      });
+
+      const result = await captureSlackTokens(session, {
+        sleep: async () => {},
+        now: advancingClock(),
+        timeoutMs: 10_000,
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe('capture_timeout');
+    });
+  });
+
   it('never puts a token value in a failure message', async () => {
     const { session } = makeScriptedSession({
       emitOnRead: { 1: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }] },
       cookies: [],
     });
 
-    const result = await captureSlackTokens(session, { ...captureDeps, now: advancingClock() });
+    const result = await captureSlackTokens(session, {
+      ...captureDeps,
+      now: advancingClock(),
+      timeoutMs: 3000,
+    });
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe('no_cookie');
+    expect(result.reason).toBe('capture_timeout');
     expect(result.message).not.toContain('xoxc-');
   });
 
@@ -1133,7 +1237,7 @@ describe('captureSlackTokens logging', () => {
   });
 
   it.each([
-    ['no_cookie', { requests: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }], cookies: [] }],
+    ['no_cookie', { requests: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }], cookiesPerRead: [COOKIES, []] }],
     ['capture_timeout', { cookies: COOKIES }],
     ['devtools_unreachable', { throwOn: 'Network.enable' }],
   ] as const)('logs the typed failure reason %s at warning', async (reason, options) => {
@@ -1149,6 +1253,20 @@ describe('captureSlackTokens logging', () => {
     const failure = records.find((r) => r.message.join('').startsWith('Token capture failed'));
     expect(failure?.level).toBe('warning');
     expect(failure?.properties.reason).toBe(reason);
+    expectNoSecrets(records);
+  });
+
+  it('logs once, at info, that a token came without the session cookie', async () => {
+    const records = captureLogs();
+
+    await captureSlackTokens(
+      makeFakeSession({ requests: [{ url: 'https://alpha.slack.com/api/x', postData: JSON_BODY }], cookies: [] }),
+      { ...captureDeps, now: advancingClock(), timeoutMs: 5000 }
+    );
+
+    const waiting = records.filter((r) => r.message.join('').startsWith('Slack token found without a session cookie'));
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]?.level).toBe('info');
     expectNoSecrets(records);
   });
 

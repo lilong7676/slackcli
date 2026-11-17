@@ -19,6 +19,7 @@ import {
   hasExited,
   signalBrowserTree,
   buildLaunchArgs,
+  shutDownBrowser,
 } from './browser-launcher';
 
 const CHROME_MAC = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -211,6 +212,60 @@ describe('hasExited', () => {
     expect(hasExited({ exitCode: null, signalCode: null })).toBe(false);
     expect(hasExited({ exitCode: 0, signalCode: null })).toBe(true);
     expect(hasExited({ exitCode: null, signalCode: 'SIGTERM' })).toBe(true);
+  });
+});
+
+describe('shutDownBrowser', () => {
+  /** A browser that exits by itself after `exitAfterMs` (never, if omitted), on a fake clock. */
+  function fakeBrowser(exitAfterMs?: number) {
+    let t = 0;
+    const events: string[] = [];
+    let killedBySignal = false;
+    const deps = {
+      exited: () => killedBySignal || (exitAfterMs !== undefined && t >= exitAfterMs),
+      signal: (signal: NodeJS.Signals) => {
+        events.push(signal);
+        if (signal === 'SIGTERM' || signal === 'SIGKILL') killedBySignal = true;
+      },
+      sweep: () => void events.push('sweep'),
+      sleep: async (ms: number) => void (t += ms),
+      now: () => t,
+    };
+    return { deps, events };
+  }
+
+  // The regression: a SIGTERM straight after Browser.close cut the browser's
+  // own shutdown short and lost the session cookie a sign-in had just set.
+  it('lets a browser that is already quitting exit on its own, without SIGTERM', async () => {
+    const { deps, events } = fakeBrowser(200);
+
+    await shutDownBrowser(deps, { graceMs: 5_000 });
+
+    expect(events).toEqual(['SIGKILL']); // only the helper sweep of an exited tree
+  });
+
+  it('signals at once when there is no grace period', async () => {
+    const { deps, events } = fakeBrowser();
+
+    await shutDownBrowser(deps);
+
+    expect(events).toEqual(['SIGTERM', 'SIGKILL', 'sweep']);
+  });
+
+  it('escalates to SIGTERM and SIGKILL once the grace period runs out', async () => {
+    const { deps, events } = fakeBrowser();
+
+    await shutDownBrowser(deps, { graceMs: 300 });
+
+    expect(events).toEqual(['SIGTERM', 'SIGKILL', 'sweep']);
+  });
+
+  it('only sweeps a browser that has already exited', async () => {
+    const { deps, events } = fakeBrowser(0);
+
+    await shutDownBrowser(deps, { graceMs: 5_000 });
+
+    expect(events).toEqual(['SIGKILL']);
   });
 });
 

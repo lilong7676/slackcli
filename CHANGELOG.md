@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`auth login-auto` waits for sign-in when the browser profile has lost its session cookie**: a profile whose Slack tokens survived in localStorage without the `d` cookie (a session Slack expired, a sign-out elsewhere, or a cookie never flushed to disk) counted as signed in, so every run closed the window within seconds with `no_cookie` and never let you sign in. A token now counts only with the cookie beside it; until then the window stays on Slack's sign-in page, and requests seen before the cookie are dropped so the token sent after sign-in is the one saved
+- **`auth login-auto` keeps the session it signed in with**: the browser was sent SIGTERM while it was still closing itself, which cut its shutdown short, so cookies set in the last seconds (the `d` session cookie a sign-in had just set) never reached the profile on disk. The next run then needed a fresh sign-in, and found the leftover tokens described above. A browser that has agreed to quit now gets up to 5 s to exit on its own before any signal, and `login-auto` returns as soon as it has, instead of waiting out a 5 s timer
+
 ## [0.19.1] - 2026-11-07
 
 ### Security
